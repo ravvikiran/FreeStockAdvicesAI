@@ -1,8 +1,11 @@
 import os
 import io
 import base64
+import time
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from functools import lru_cache
 
 import yfinance as yf
 import matplotlib.pyplot as plt
@@ -13,6 +16,66 @@ try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class CacheManager:
+    """Simple in-memory cache for API calls."""
+    
+    def __init__(self, ttl_seconds: int = 300):
+        self._cache: Dict[str, tuple[Any, float]] = {}
+        self._ttl = ttl_seconds
+    
+    def get(self, key: str) -> Optional[Any]:
+        if key in self._cache:
+            value, timestamp = self._cache[key]
+            if time.time() - timestamp < self._ttl:
+                logger.info(f"Cache hit for: {key}")
+                return value
+            else:
+                del self._cache[key]
+                logger.info(f"Cache expired for: {key}")
+        return None
+    
+    def set(self, key: str, value: Any) -> None:
+        self._cache[key] = (value, time.time())
+        logger.info(f"Cache set for: {key}")
+    
+    def clear(self) -> None:
+        self._cache.clear()
+
+
+market_cache = CacheManager(ttl_seconds=300)
+news_cache = CacheManager(ttl_seconds=600)
+
+
+def retry_with_backoff(max_retries: int = 3, initial_delay: float = 1.0):
+    """Decorator to retry functions with exponential backoff."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                        delay *= 2
+                    else:
+                        logger.error(f"All {max_retries} attempts failed: {e}")
+            if last_exception:
+                raise last_exception
+            raise RuntimeError(f"Function {func.__name__} failed after {max_retries} retries")
+        return wrapper
+    return decorator
 
 
 class TickerExtractorTool:
@@ -67,7 +130,7 @@ Return just the ticker symbol:"""
             'apple': 'AAPL',
             'microsoft': 'MSFT',
             'google': 'GOOGL',
-            'amazon': 'AMNV',
+            'amazon': 'AMZN',
             'nvidia': 'NVDA',
             'meta': 'META',
             'facebook': 'META',
@@ -97,8 +160,15 @@ class MarketDataTool:
     def __init__(self):
         pass
 
+    @retry_with_backoff(max_retries=3, initial_delay=1.0)
     def run(self, ticker: str) -> Dict[str, Any]:
+        cache_key = f"market_data_{ticker}"
+        cached = market_cache.get(cache_key)
+        if cached:
+            return cached
+        
         try:
+            logger.info(f"Fetching market data for: {ticker}")
             stock = yf.Ticker(ticker)
             info = stock.info
             
@@ -107,7 +177,8 @@ class MarketDataTool:
             
             previous_close = info.get('previousClose', info.get('regularMarketPreviousClose', 0))
             
-            fifty_two_week = stock.info.get('fiftyTwoWeekLow', 0), stock.info.get('fiftyTwoWeekHigh', 0)
+            fifty_two_week_low = stock.info.get('fiftyTwoWeekLow', 0)
+            fifty_two_week_high = stock.info.get('fiftyTwoWeekHigh', 0)
             
             data = {
                 'ticker': ticker,
@@ -123,8 +194,8 @@ class MarketDataTool:
                 'beta': info.get('beta', 0),
                 'sector': info.get('sector', 'Unknown'),
                 'industry': info.get('industry', 'Unknown'),
-                'fifty_two_week_low': fifty_two_week[0],
-                'fifty_two_week_high': fifty_two_week[1],
+                'fifty_two_week_low': fifty_two_week_low,
+                'fifty_two_week_high': fifty_two_week_high,
                 'dividend_yield': info.get('dividendYield', 0),
                 'profit_margins': info.get('profitMargins', 0),
                 'roe': info.get('returnOnEquity', 0),
@@ -133,8 +204,11 @@ class MarketDataTool:
                 'recommendation': info.get('recommendationKey', 'N/A'),
             }
             
+            market_cache.set(cache_key, data)
+            logger.info(f"Market data cached for: {ticker}")
             return data
         except Exception as e:
+            logger.error(f"Error fetching market data for {ticker}: {e}")
             return {'error': str(e), 'ticker': ticker}
 
 
@@ -147,7 +221,13 @@ class NewsSearchTool:
     def __init__(self):
         pass
 
+    @retry_with_backoff(max_retries=3, initial_delay=1.0)
     def run(self, ticker: str) -> str:
+        cache_key = f"news_{ticker}"
+        cached = news_cache.get(cache_key)
+        if cached:
+            return cached
+        
         if DDGS is None:
             return "DuckDuckGo search not available. Please install duckduckgo-search package."
         
@@ -161,6 +241,7 @@ class NewsSearchTool:
         ]
         
         try:
+            logger.info(f"Searching news for: {ticker}")
             with DDGS() as ddgs:
                 for query in search_queries[:4]:
                     try:
@@ -171,9 +252,11 @@ class NewsSearchTool:
                                 'url': r.get('href', ''),
                                 'snippet': r.get('body', '')[:200]
                             })
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"Search query failed: {query}, error: {e}")
                         continue
         except Exception as e:
+            logger.error(f"Error searching for news for {ticker}: {e}")
             return f"Error searching for news: {str(e)}"
         
         if not results:
@@ -185,6 +268,8 @@ class NewsSearchTool:
             formatted += f"{r['snippet']}\n"
             formatted += f"Source: {r['url']}\n\n"
         
+        news_cache.set(cache_key, formatted)
+        logger.info(f"News cached for: {ticker}")
         return formatted
 
 
@@ -256,6 +341,7 @@ class ChartGeneratorTool:
             
         except Exception as e:
             print(f"Error generating chart: {e}")
+            plt.close()
             return None
 
 

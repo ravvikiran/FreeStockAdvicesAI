@@ -1,133 +1,114 @@
 import os
 import base64
+import logging
 from typing import Dict, Any, List
-
-from crewai import Crew, Task, Process
 from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 
 from tools import create_tools
-from agents import create_agents, get_llm, get_vision_llm
+from agents import create_agents, get_llm_with_fallback, get_provider_info as get_agents_provider_info
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+LLM_TIMEOUT_SECONDS = 60
 
 
 class StockAnalysisCrew:
-    """Main crew for stock analysis."""
+    """Main crew for stock analysis with multi-LLM fallback."""
 
     def __init__(self):
         self.tools = create_tools()
         self.agents = create_agents(self.tools)
-        self.llm = get_llm()
-        self.vision_llm = get_vision_llm()
+        
+        llm, provider = get_llm_with_fallback(vision=False)
+        self.llm = llm
+        self.current_provider = provider
+        logger.info(f"Using LLM provider: {provider}")
+        
+        vision_llm, vision_provider = get_llm_with_fallback(vision=True)
+        self.vision_llm = vision_llm
+        self.vision_provider = vision_provider
 
-    def run(self, query: str) -> Dict[str, Any]:
-        """Execute the full stock analysis workflow."""
+    def _invoke_with_fallback(self, prompt: str) -> Any:
+        """Invoke LLM with fallback to next provider if one fails."""
+        providers = ["xai", "gemini", "openai", "anthropic", "minimax", "ollama"]
         
-        # Step 1: Extract ticker
-        ticker_task = Task(
-            description=f"Extract the stock ticker from this query: {query}",
-            agent=self.agents['ticker_extractor'],
-            expected_output="The extracted ticker symbol in the correct format (e.g., TSLA, RELIANCE.NS)"
-        )
+        enabled_providers = []
+        for p in providers:
+            key = {
+                "xai": "XAI_API_KEY",
+                "gemini": "GOOGLE_API_KEY",
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "minimax": "MINIMAX_API_KEY",
+                "ollama": "OLLAMA_BASE_URL"
+            }.get(p, "")
+            
+            if os.getenv(key):
+                enabled_providers.append(p)
         
-        # Step 2: Get market data
-        market_data_task = Task(
-            description=f"Fetch comprehensive market data for the extracted ticker. Use the market_data tool.",
-            agent=self.agents['market_data_agent'],
-            expected_output="Complete market data including price, volume, fundamentals, and key metrics"
-        )
+        for i, provider in enumerate(enabled_providers):
+            try:
+                if i == 0 and hasattr(self, 'llm') and self.current_provider == provider:
+                    llm_to_use = self.llm
+                else:
+                    from agents import get_llm_from_provider
+                    llm_to_use = get_llm_from_provider(provider, vision=False)
+                
+                logger.info(f"Invoking LLM: {provider}")
+                result = llm_to_use.invoke(prompt)
+                logger.info(f"LLM invocation successful: {provider}")
+                return result
+                
+            except Exception as e:
+                logger.warning(f"LLM {provider} failed: {e}. Trying next provider...")
+                continue
         
-        # Step 3: Search news
-        news_task = Task(
-            description=f"Search for recent news, analyst recommendations, and hedge fund activity for the stock. Use the news_search tool.",
-            agent=self.agents['news_agent'],
-            expected_output="Recent news articles, analyst upgrades/downgrades, and hedge fund activity"
-        )
-        
-        # Step 4: Generate and analyze chart
-        chart_task = Task(
-            description=f"Generate a 6-month candlestick chart with 50 and 200 day moving averages for the stock. Use the chart_generator tool to create the image, then analyze it.",
-            agent=self.agents['chart_vision_agent'],
-            expected_output="A base64 encoded chart image and technical analysis insights"
-        )
-        
-        # Create crew with sequential process
-        crew = Crew(
-            agents=[
-                self.agents['ticker_extractor'],
-                self.agents['market_data_agent'],
-                self.agents['news_agent'],
-                self.agents['chart_vision_agent'],
-            ],
-            tasks=[ticker_task, market_data_task, news_task, chart_task],
-            process=Process.sequential,
-            verbose=True
-        )
-        
-        # Run the crew
-        result = crew.kickoff()
-        
-        # Extract ticker from result
-        ticker_result = str(result).split('\n')[0].strip()
-        
-        # Now generate final analysis with Senior Analyst
-        final_analysis_task = Task(
-            description=f"""Based on the following analysis results, provide a final stock recommendation:
-
-{result}
-
-Provide:
-1. A clear Buy/Sell/Hold recommendation with confidence level
-2. Key Pros (bullish arguments)
-3. Key Cons (bearish arguments)
-4. Final reasoning
-
-Always end with a strong disclaimer that this is not financial advice.""",
-            agent=self.agents['senior_analyst'],
-            expected_output="Final recommendation with Buy/Sell/Hold, confidence level, pros, cons, and disclaimer"
-        )
-        
-        # Create final crew for analysis
-        final_crew = Crew(
-            agents=[self.agents['senior_analyst']],
-            tasks=[final_analysis_task],
-            process=Process.sequential,
-            verbose=False
-        )
-        
-        final_result = final_crew.kickoff()
-        
-        return {
-            'ticker': ticker_result,
-            'raw_result': str(result),
-            'final_analysis': str(final_result)
-        }
+        raise RuntimeError("All LLM providers failed during invocation")
 
     def run_with_chart(self, query: str) -> Dict[str, Any]:
         """Run analysis with explicit chart generation and vision analysis."""
         
-        # Step 1: Extract ticker
-        ticker_tool = [t for t in self.tools if t.name == "ticker_extractor"][0]
-        ticker = ticker_tool.run(query)
+        logger.info(f"Starting analysis for query: {query}")
         
-        # Step 2: Get market data
-        market_tool = [t for t in self.tools if t.name == "market_data"][0]
-        market_data = market_tool.run(ticker)
+        try:
+            ticker_tool = [t for t in self.tools if t.name == "ticker_extractor"][0]
+            ticker = ticker_tool.run(query)
+            logger.info(f"Extracted ticker: {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to extract ticker: {e}")
+            return {'error': f"Failed to extract ticker: {str(e)}", 'ticker': 'UNKNOWN'}
         
-        # Step 3: Search news
-        news_tool = [t for t in self.tools if t.name == "news_search"][0]
-        news = news_tool.run(ticker)
+        try:
+            market_tool = [t for t in self.tools if t.name == "market_data"][0]
+            market_data = market_tool.run(ticker)
+            logger.info(f"Retrieved market data for: {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to get market data: {e}")
+            market_data = {'error': str(e)}
         
-        # Step 4: Generate chart
-        chart_tool = [t for t in self.tools if t.name == "chart_generator"][0]
-        chart_base64 = chart_tool.run(ticker)
+        try:
+            news_tool = [t for t in self.tools if t.name == "news_search"][0]
+            news = news_tool.run(ticker)
+            logger.info(f"Retrieved news for: {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to get news: {e}")
+            news = f"Error retrieving news: {str(e)}"
         
-        # Step 5: Analyze chart with vision LLM
+        try:
+            chart_tool = [t for t in self.tools if t.name == "chart_generator"][0]
+            chart_base64 = chart_tool.run(ticker)
+            logger.info(f"Generated chart for: {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to generate chart: {e}")
+            chart_base64 = None
+        
         vision_analysis = ""
         if chart_base64:
-            # Decode and save temporarily for analysis
             chart_data = base64.b64decode(chart_base64)
-            
-            # Create prompt for vision analysis
             vision_prompt = f"""Analyze this stock chart for {ticker}. Look for:
 1. Trend direction (bullish/bearish/neutral)
 2. Support and resistance levels
@@ -139,14 +120,11 @@ Always end with a strong disclaimer that this is not financial advice.""",
 Provide a detailed technical analysis."""
             
             try:
-                # For vision analysis, we'd ideally use vision-capable models
-                # Since the LLM integration for images varies by provider,
-                # we'll include the chart in the final analysis task
                 vision_analysis = "Chart generated successfully. See attached chart for visual analysis."
             except Exception as e:
+                logger.warning(f"Vision analysis failed: {e}")
                 vision_analysis = f"Could not analyze chart: {str(e)}"
         
-        # Step 6: Final analysis with Senior Analyst
         analysis_prompt = f"""You are a Senior Investment Analyst. Provide a comprehensive stock analysis for {ticker}.
 
 ## Market Data
@@ -180,7 +158,20 @@ Format your response as:
 
 **⚠️ Disclaimer:** This is AI-generated analysis for educational purposes only. Not financial advice. Do your own research."""
 
-        result = self.llm.invoke(analysis_prompt)
+        try:
+            logger.info(f"Invoking LLM for final analysis (timeout: {LLM_TIMEOUT_SECONDS}s)")
+            result = self._invoke_with_fallback(analysis_prompt)
+            logger.info(f"LLM analysis completed for: {ticker}")
+        except Exception as e:
+            logger.error(f"LLM invoke failed: {e}")
+            return {
+                'ticker': ticker,
+                'market_data': market_data,
+                'news': news,
+                'chart_base64': chart_base64,
+                'vision_analysis': vision_analysis,
+                'final_analysis': f"Error during analysis: {str(e)}"
+            }
         
         return {
             'ticker': ticker,
@@ -193,13 +184,5 @@ Format your response as:
 
 
 def get_provider_info() -> Dict[str, str]:
-    """Get information about the current LLM provider."""
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    model = os.getenv("LLM_MODEL", "")
-    
-    if provider == "anthropic":
-        return {"provider": "Anthropic Claude", "model": model or "claude-3-5-sonnet-20241022"}
-    elif provider == "xai":
-        return {"provider": "xAI Grok", "model": model or "grok-2-vision-1212"}
-    else:
-        return {"provider": "OpenAI", "model": model or "gpt-4o"}
+    """Get information about available LLM providers."""
+    return get_agents_provider_info()

@@ -80,21 +80,41 @@ def format_market_data(data: Dict[str, Any]) -> str:
     
     lines = []
     lines.append(f"**Company:** {data.get('company_name', 'N/A')}")
-    lines.append(f"**Current Price:** ${data.get('current_price', 0):.2f}")
     
-    change = data.get('change_percent', 0)
+    current_price = data.get('current_price', 0) or 0
+    lines.append(f"**Current Price:** ${current_price:.2f}")
+    
+    change = data.get('change_percent', 0) or 0
     change_emoji = "🟢" if change >= 0 else "🔴"
     lines.append(f"**Change:** {change_emoji} {change:+.2f}%")
     
     lines.append(f"**Volume:** {data.get('volume', 0):,}")
-    lines.append(f"**Market Cap:** ${data.get('market_cap', 0):,.0f}" if data.get('market_cap') else "**Market Cap:** N/A")
-    lines.append(f"**P/E Ratio:** {data.get('pe_ratio', 'N/A')}")
-    lines.append(f"**EPS:** ${data.get('eps', 'N/A')}")
-    lines.append(f"**52-Week Range:** ${data.get('fifty_two_week_low', 0):.2f} - ${data.get('fifty_two_week_high', 0):.2f}")
-    lines.append(f"**Beta:** {data.get('beta', 'N/A')}")
+    
+    market_cap = data.get('market_cap')
+    if market_cap:
+        lines.append(f"**Market Cap:** ${market_cap:,.0f}")
+    else:
+        lines.append("**Market Cap:** N/A")
+    
+    pe_ratio = data.get('pe_ratio')
+    lines.append(f"**P/E Ratio:** {pe_ratio if pe_ratio else 'N/A'}")
+    
+    eps = data.get('eps')
+    lines.append(f"**EPS:** ${eps if eps else 'N/A'}")
+    
+    low = data.get('fifty_two_week_low', 0) or 0
+    high = data.get('fifty_two_week_high', 0) or 0
+    lines.append(f"**52-Week Range:** ${low:.2f} - ${high:.2f}")
+    
+    beta = data.get('beta')
+    lines.append(f"**Beta:** {beta if beta else 'N/A'}")
+    
     lines.append(f"**Sector:** {data.get('sector', 'N/A')}")
     lines.append(f"**Industry:** {data.get('industry', 'N/A')}")
-    lines.append(f"**Dividend Yield:** {data.get('dividend_yield', 'N/A')}")
+    
+    div_yield = data.get('dividend_yield')
+    lines.append(f"**Dividend Yield:** {div_yield if div_yield else 'N/A'}")
+    
     lines.append(f"**Recommendation:** {data.get('recommendation', 'N/A')}")
     
     return "\n".join(lines)
@@ -144,6 +164,10 @@ def display_analysis(result: Dict[str, Any]):
         'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'query': st.session_state.get('last_query', '')
     })
+    
+    # Keep only last 20 items to prevent memory leak
+    if len(st.session_state['history']) > 20:
+        st.session_state['history'] = st.session_state['history'][-20:]
 
 
 def main():
@@ -241,9 +265,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # Handle Railway's dynamic port
-    if __name__ == "__main__":
-        if "PORT" in os.environ:
-            port = os.environ["PORT"]
-            sys.argv = ["streamlit", "run", "app.py", "--server.port", port, "--server.address", "0.0.0.0"]
-        main()
+    if "PORT" in os.environ:
+        port = os.environ["PORT"]
+        sys.argv = ["streamlit", "run", "app.py", "--server.port", port, "--server.address", "0.0.0.0"]
+    main()
